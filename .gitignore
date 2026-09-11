@@ -1,0 +1,24 @@
+# Local dev database cluster (self-managed Postgres data directory, never committed)
+.devdb/
+
+# Claude session artifacts
+.claude/
+
+# Node
+node_modules/
+
+# Flutter/Dart (added once the app is scaffolded)
+.dart_tool/
+.packages
+build/
+*.lock
+!pubspec.lock
+
+# Env/secrets
+.env
+.env.*
+*.pem
+
+# OS
+.DS_Store
+Thumbs.db
