@@ -27,4 +27,11 @@ class AppConfig {
   );
 
   static bool get isConfigured => supabaseAnonKey.isNotEmpty;
+
+  /// Release version (e.g. "1.0.2"), passed as --dart-define=OPENPLAY_VERSION
+  /// by the release/desktop builds; "dev" for local runs.
+  static const appVersion = String.fromEnvironment(
+    'OPENPLAY_VERSION',
+    defaultValue: 'dev',
+  );
 }

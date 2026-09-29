@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../services/openplay_api.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_spacing.dart';
+import '../widgets/app_version_label.dart';
 import 'blocked_users_screen.dart';
 import 'my_sessions_screen.dart';
 
@@ -99,6 +100,8 @@ class AccountScreen extends StatelessWidget {
             title: 'Sign in / Create account',
             onTap: onSignInRequested,
           ),
+        const SizedBox(height: AppSpacing.xl),
+        const AppVersionLabel(),
       ],
     );
   }

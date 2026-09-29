@@ -139,7 +139,7 @@ release.
 - **Windows** installs update themselves from that GitHub Release
   (`desktop/electron/updater.cjs`): checked 12 s after launch and every 6 h,
   downloaded in the background, installed on "Restart now" or next close.
-  Updater activity is logged to `%APPDATA%\OpenPlay\updater.log`.
+  Updater activity is logged to `%APPDATA%\openplay-desktop\updater.log`.
 - **Android** has no in-app updater: users install the APK from the release.
 
 Prerequisites: `gh` logged in with write access to the repository in
