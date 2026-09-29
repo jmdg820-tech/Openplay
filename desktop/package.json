@@ -1,6 +1,6 @@
 {
   "name": "openplay-desktop",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "description": "OpenPlay Windows desktop shell (Electron, hosting the OpenPlay Flutter Web build).",
   "main": "electron/main.cjs",
