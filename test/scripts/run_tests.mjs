@@ -630,6 +630,137 @@ async function main() {
   });
 
   // =======================================================================
+  // SECTION 3b — SESSION LIFECYCLE: ended-session join protection
+  // (migration 026 — join_session() must reject once now() >= end_time)
+  // =======================================================================
+
+  await t("session_lifecycle", "join succeeds normally on a session well before its end_time (regression baseline)", async () => {
+    const venueL1 = await createVenue(su, organizerId);
+    const s = await createSession(su, organizerId, venueL1, { capacity: 4, startOffsetMin: 60, durationMin: 90 });
+    const u = await createUser(su, { name: "OnTime Player" });
+    await withClients(async (open) => {
+      const c = await open("authenticated", u);
+      const r = await c.query(`select * from join_session($1, null, null, null)`, [s]);
+      assert.equal(r.rows[0].status, "confirmed");
+    });
+  });
+
+  await t("session_lifecycle", "join is rejected once the session has clearly ended (end_time well in the past)", async () => {
+    const venueL2 = await createVenue(su, organizerId);
+    // start_time = now-120min, end_time = now-60min: safely in the past on both ends,
+    // still satisfies the sessions_time_check (end_time > start_time) constraint.
+    const s = await createSession(su, organizerId, venueL2, {
+      capacity: 4,
+      startOffsetMin: -120,
+      durationMin: 60,
+    });
+    const u = await createUser(su, { name: "Late Joiner" });
+    await withClients(async (open) => {
+      const c = await open("authenticated", u);
+      await assert.rejects(
+        c.query(`select * from join_session($1, null, null, null)`, [s]),
+        /already ended/i
+      );
+      const count = await su.query(`select count(*) from session_participants where session_id = $1`, [s]);
+      assert.equal(Number(count.rows[0].count), 0, "no participant row must be created for a rejected join");
+    });
+  });
+
+  await t("session_lifecycle", "join is rejected exactly at the end_time boundary (now() >= end_time, not just >)", async () => {
+    const venueL3 = await createVenue(su, organizerId);
+    const s = await createSession(su, organizerId, venueL3, { capacity: 4, startOffsetMin: -30, durationMin: 15 });
+    // Snapshot the DB's own current time, then pin end_time to exactly that
+    // instant. By the time the join_session call below actually executes,
+    // real elapsed time guarantees now() > that pinned instant, giving a
+    // deterministic (non-flaky) exercise of the ">=" boundary rather than a
+    // race against wall-clock timing.
+    const { rows: nowRows } = await su.query(`select now() as ts`);
+    await su.query(`update sessions set end_time = $1 where id = $2`, [nowRows[0].ts, s]);
+    const u = await createUser(su, { name: "Boundary Joiner" });
+    await withClients(async (open) => {
+      const c = await open("authenticated", u);
+      await assert.rejects(
+        c.query(`select * from join_session($1, null, null, null)`, [s]),
+        /already ended/i
+      );
+    });
+  });
+
+  await t("session_lifecycle", "waitlist join is also rejected for an ended session, not just confirmed join", async () => {
+    const venueL4 = await createVenue(su, organizerId);
+    // singles sessions require capacity >= 2 (sessions_capacity_check) -- use
+    // 2 fillers to reach full capacity, matching the constraint.
+    const s = await createSession(su, organizerId, venueL4, { sessionType: "singles", capacity: 2, startOffsetMin: 60, durationMin: 30 });
+    const filler1 = await createUser(su, { name: "Ended Filler 1" });
+    const filler2 = await createUser(su, { name: "Ended Filler 2" });
+    const waiter = await createUser(su, { name: "Ended Waiter" });
+
+    await withClients(async (open) => {
+      // Fill both slots while the session is still active.
+      const cFiller1 = await open("authenticated", filler1);
+      const rFiller1 = await cFiller1.query(`select * from join_session($1, null, null, null)`, [s]);
+      assert.equal(rFiller1.rows[0].status, "confirmed");
+      const cFiller2 = await open("authenticated", filler2);
+      const rFiller2 = await cFiller2.query(`select * from join_session($1, null, null, null)`, [s]);
+      assert.equal(rFiller2.rows[0].status, "confirmed");
+
+      // Now the session ends (e.g. its scheduled time simply passed). Both
+      // start_time and end_time must move together to keep satisfying
+      // sessions_time_check (end_time > start_time).
+      await su.query(
+        `update sessions set start_time = now() - interval '2 hours', end_time = now() - interval '1 minute' where id = $1`,
+        [s]
+      );
+
+      // A new joiner would have gone to the waitlist (capacity is full) had
+      // the session still been active -- it must instead be rejected outright.
+      const cWaiter = await open("authenticated", waiter);
+      await assert.rejects(
+        cWaiter.query(`select * from join_session($1, null, null, null)`, [s]),
+        /already ended/i
+      );
+      const waiterRow = await su.query(
+        `select count(*) from session_participants where session_id = $1 and user_id = $2`,
+        [s, waiter]
+      );
+      assert.equal(Number(waiterRow.rows[0].count), 0, "no waitlist row must be created once the session has ended");
+    });
+  });
+
+  await t("session_lifecycle", "concurrent joins on a still-active session enforce capacity atomically after the end_time guard was added", async () => {
+    const venueL5 = await createVenue(su, organizerId);
+    // singles sessions require capacity >= 2 (sessions_capacity_check); fill
+    // one slot sequentially first, then race the last slot between two users
+    // (same pattern as the pre-existing "last slot" concurrency test).
+    const s = await createSession(su, organizerId, venueL5, { sessionType: "singles", capacity: 2, startOffsetMin: 60, durationMin: 30 });
+    const first = await createUser(su, { name: "EndCheckFirst" });
+    const raceA = await createUser(su, { name: "EndCheckRaceA" });
+    const raceB = await createUser(su, { name: "EndCheckRaceB" });
+
+    await withClients(async (open) => {
+      const cFirst = await open("authenticated", first);
+      await cFirst.query(`select * from join_session($1, null, null, null)`, [s]); // fills 1 of 2 slots
+
+      const cA = await open("authenticated", raceA);
+      const cB = await open("authenticated", raceB);
+
+      const [ra, rb] = await Promise.all([
+        cA.query(`select * from join_session($1, null, null, null)`, [s]),
+        cB.query(`select * from join_session($1, null, null, null)`, [s]),
+      ]);
+
+      const statuses = [ra.rows[0].status, rb.rows[0].status].sort();
+      assert.deepEqual(statuses, ["confirmed", "waitlisted"]);
+
+      const occ = await su.query(
+        `select count(*) from session_participants where session_id = $1 and status in ('confirmed','pending_confirmation')`,
+        [s]
+      );
+      assert.equal(Number(occ.rows[0].count), 2, "capacity must still be enforced atomically alongside the new end_time guard");
+    });
+  });
+
+  // =======================================================================
   // SECTION 4 — REMINDER IDEMPOTENCY (9 cases)
   // =======================================================================
 
@@ -1355,6 +1486,39 @@ async function main() {
     });
   });
 
+  // Migration 025 (function-level EXECUTE default-privilege fix): directly
+  // exercise the exact live-verified exploit ("anonymous REST call to
+  // /rest/v1/rpc/promote_next_waitlisted returned HTTP 204") plus its
+  // siblings, as actual RPC-call attempts rather than only inspecting
+  // pg_proc ACLs. set_updated_at is covered by the separate migration 027
+  // fix-forward migration: unlike the other trigger-only functions, its
+  // origin migration (004) never revoked EXECUTE from `public` at all, so
+  // it remained callable via the PUBLIC grant even after revoking from
+  // anon/authenticated specifically (PUBLIC grants apply to every role
+  // unconditionally, independent of any role-specific revoke). It's kept
+  // in this same migration-025-labeled block because it's the same class
+  // of exploit-verification test, even though the fix landed in 027 (025
+  // was already applied in production by the time the gap was found, so
+  // the fix had to ship as a new migration rather than editing 025).
+  const internalOnlyRpcs = [
+    { migration: "025", role: "anon", sql: "select promote_next_waitlisted($1)", args: [sessionId] },
+    { migration: "025", role: "authenticated", sql: "select promote_next_waitlisted($1)", args: [sessionId] },
+    { migration: "025", role: "anon", sql: "select expire_pending_promotions()", args: [] },
+    { migration: "025", role: "authenticated", sql: "select expire_pending_promotions()", args: [] },
+    { migration: "025", role: "anon", sql: "select enqueue_session_reminders(90)", args: [] },
+    { migration: "025", role: "authenticated", sql: "select enqueue_session_reminders(90)", args: [] },
+    { migration: "027", role: "anon", sql: "select set_updated_at()", args: [] },
+    { migration: "027", role: "authenticated", sql: "select set_updated_at()", args: [] },
+  ];
+  for (const { migration, role, sql, args } of internalOnlyRpcs) {
+    await t("grants", `migration ${migration}: ${role} cannot directly call ${sql.replace("select ", "")}`, async () => {
+      await withClients(async (open) => {
+        const c = await open(role, role === "authenticated" ? nonMemberId : undefined);
+        await assert.rejects(c.query(sql, args), /permission denied/i);
+      });
+    });
+  }
+
   await t("grants", "SECURITY DEFINER RPCs still work after the grants fix (join_session, get_session_roster, cancel_session path)", async () => {
     await withClients(async (open) => {
       const freshVenue = await createVenue(su, organizerId);
@@ -1374,6 +1538,413 @@ async function main() {
   });
 
   // =======================================================================
+  // SECTION — MY ROSTER ENTRY (migration 028): the server tells the caller
+  // which roster row is theirs, so Leave/Confirm survive navigation/restart.
+  // Each "return to the screen" below is a brand-new connection -- i.e. no
+  // client-side memory at all, only what the server reports.
+  // =======================================================================
+
+  const occupiedCount = async (s) => {
+    const r = await su.query(
+      `select count(*) from session_participants where session_id = $1 and status in ('confirmed','pending_confirmation')`,
+      [s]
+    );
+    return Number(r.rows[0].count);
+  };
+
+  await t("my_roster", "is_self is true only for the caller's own row; other users and anon see false everywhere", async () => {
+    const v = await createVenue(su, organizerId);
+    const s = await createSession(su, organizerId, v, { capacity: 4 });
+    const u1 = await createUser(su, { name: "Self One" });
+    const u2 = await createUser(su, { name: "Self Two" });
+    await withClients(async (open) => {
+      const c1 = await open("authenticated", u1);
+      const j1 = await c1.query(`select * from join_session($1, null, null, null)`, [s]);
+      const c2 = await open("authenticated", u2);
+      const j2 = await c2.query(`select * from join_session($1, null, null, null)`, [s]);
+
+      const r1 = await (await open("authenticated", u1)).query(`select * from get_session_roster($1)`, [s]);
+      const mine1 = r1.rows.filter((r) => r.is_self);
+      assert.equal(mine1.length, 1);
+      assert.equal(mine1[0].participant_id, j1.rows[0].participant_id);
+
+      const r2 = await (await open("authenticated", u2)).query(`select * from get_session_roster($1)`, [s]);
+      assert.deepEqual(r2.rows.filter((r) => r.is_self).map((r) => r.participant_id), [j2.rows[0].participant_id]);
+
+      const outsider = await createUser(su, { name: "Self Outsider" });
+      const ro = await (await open("authenticated", outsider)).query(`select * from get_session_roster($1)`, [s]);
+      assert.ok(ro.rows.every((r) => r.is_self === false), "a different user must never see is_self=true");
+
+      const ra = await (await open("anon")).query(`select * from get_session_roster($1)`, [s]);
+      assert.ok(ra.rows.every((r) => r.is_self === false), "anon must never see is_self=true");
+
+      const rOrg = await (await open("authenticated", organizerId)).query(`select * from get_session_roster($1)`, [s]);
+      assert.ok(rOrg.rows.every((r) => r.is_self === false), "organizer who did not join sees no self row");
+    });
+  });
+
+  await t("my_roster", "guest rows are never is_self (guests keep proving identity with their token)", async () => {
+    const v = await createVenue(su, organizerId);
+    const s = await createSession(su, organizerId, v, { capacity: 4 });
+    await withClients(async (open) => {
+      const g = await open("anon");
+      await g.query(`select * from join_session($1, $2, $3, $4)`, [s, "Guest Self", "email", "guest-self@example.com"]);
+      const r = await (await open("anon")).query(`select * from get_session_roster($1)`, [s]);
+      assert.equal(r.rows.length, 1);
+      assert.equal(r.rows[0].is_self, false);
+    });
+  });
+
+  await t("my_roster", "confirmed participant: join, 'navigate away', return -> own row still identifiable and Leave succeeds", async () => {
+    const v = await createVenue(su, organizerId);
+    const s = await createSession(su, organizerId, v, { capacity: 4 });
+    const u = await createUser(su, { name: "Returner" });
+    await withClients(async (open) => {
+      await (await open("authenticated", u)).query(`select * from join_session($1, null, null, null)`, [s]);
+      // Fresh connection = fresh app launch: nothing remembered client-side.
+      const back = await open("authenticated", u);
+      const r = await back.query(`select * from get_session_roster($1)`, [s]);
+      const mine = r.rows.find((x) => x.is_self);
+      assert.ok(mine, "own row must be identifiable after returning");
+      assert.equal(mine.status, "confirmed");
+      await back.query(`select leave_session($1, null)`, [mine.participant_id]);
+      const after = await back.query(`select * from get_session_roster($1)`, [s]);
+      assert.equal(after.rows.filter((x) => x.is_self).length, 0, "after leaving, no self row remains");
+    });
+  });
+
+  await t("my_roster", "waitlisted participants: FIFO waitlist_position is correct and stable across returns", async () => {
+    const v = await createVenue(su, organizerId);
+    const s = await createSession(su, organizerId, v, { sessionType: "singles", capacity: 2 });
+    const fillers = [await createUser(su, { name: "PosF1" }), await createUser(su, { name: "PosF2" })];
+    const waiters = [
+      await createUser(su, { name: "PosW1" }),
+      await createUser(su, { name: "PosW2" }),
+      await createUser(su, { name: "PosW3" }),
+    ];
+    await withClients(async (open) => {
+      for (const f of fillers) await (await open("authenticated", f)).query(`select * from join_session($1, null, null, null)`, [s]);
+      for (const w of waiters) {
+        const r = await (await open("authenticated", w)).query(`select * from join_session($1, null, null, null)`, [s]);
+        assert.equal(r.rows[0].status, "waitlisted");
+      }
+      for (let i = 0; i < waiters.length; i++) {
+        for (let round = 0; round < 2; round++) {
+          const c = await open("authenticated", waiters[i]);
+          const r = await c.query(`select * from get_session_roster($1)`, [s]);
+          const mine = r.rows.find((x) => x.is_self);
+          assert.equal(mine.status, "waitlisted");
+          assert.equal(mine.waitlist_position, i + 1, `waiter ${i + 1} position (round ${round})`);
+          const mp = await c.query(`select * from get_my_participations()`);
+          assert.equal(mp.rows.length, 1);
+          assert.equal(mp.rows[0].waitlist_position, i + 1, "get_my_participations position must match the roster");
+        }
+      }
+      const any = await (await open("anon")).query(`select * from get_session_roster($1)`, [s]);
+      assert.ok(any.rows.filter((x) => x.status !== "waitlisted").every((x) => x.waitlist_position === null));
+    });
+  });
+
+  await t("my_roster", "promoted waitlister: return after promotion -> Confirm available, succeeds once, duplicate rejected", async () => {
+    const v = await createVenue(su, organizerId);
+    const s = await createSession(su, organizerId, v, { sessionType: "singles", capacity: 2 });
+    const f1 = await createUser(su, { name: "PromF1" });
+    const f2 = await createUser(su, { name: "PromF2" });
+    const w = await createUser(su, { name: "PromW" });
+    await withClients(async (open) => {
+      const c1 = await open("authenticated", f1);
+      const j1 = await c1.query(`select * from join_session($1, null, null, null)`, [s]);
+      await (await open("authenticated", f2)).query(`select * from join_session($1, null, null, null)`, [s]);
+      await (await open("authenticated", w)).query(`select * from join_session($1, null, null, null)`, [s]);
+      await c1.query(`select leave_session($1, null)`, [j1.rows[0].participant_id]); // promotes w
+
+      const back = await open("authenticated", w); // "reopens the app" later
+      const mp = await back.query(`select * from get_my_participations()`);
+      assert.equal(mp.rows.length, 1);
+      assert.equal(mp.rows[0].status, "pending_confirmation");
+      assert.ok(mp.rows[0].seconds_until_expiry > 0 && mp.rows[0].seconds_until_expiry <= 900);
+
+      const r = await back.query(`select * from get_session_roster($1)`, [s]);
+      const mine = r.rows.find((x) => x.is_self);
+      assert.equal(mine.status, "pending_confirmation");
+      assert.ok(mine.seconds_until_expiry > 0);
+
+      // A different user can neither see it as theirs nor confirm it.
+      const other = await open("authenticated", f2);
+      const ro = await other.query(`select * from get_session_roster($1)`, [s]);
+      assert.equal(ro.rows.find((x) => x.participant_id === mine.participant_id).is_self, false);
+      await assert.rejects(other.query(`select confirm_promotion($1, null)`, [mine.participant_id]), /not authorized/i);
+
+      await back.query(`select confirm_promotion($1, null)`, [mine.participant_id]);
+      const after = await su.query(`select status from session_participants where id = $1`, [mine.participant_id]);
+      assert.equal(after.rows[0].status, "confirmed");
+      await assert.rejects(
+        back.query(`select confirm_promotion($1, null)`, [mine.participant_id]),
+        /no longer available|expired/i,
+        "a second confirmation must be rejected"
+      );
+      assert.equal(await occupiedCount(s), 2, "capacity never exceeded");
+    });
+  });
+
+  await t("my_roster", "get_my_participations: caller-only rows, excludes ended sessions, anon cannot execute", async () => {
+    const v = await createVenue(su, organizerId);
+    const live = await createSession(su, organizerId, v, { capacity: 4 });
+    const ended = await createSession(su, organizerId, v, { capacity: 4 });
+    const u = await createUser(su, { name: "MyPart U" });
+    const other = await createUser(su, { name: "MyPart Other" });
+    await withClients(async (open) => {
+      const cu = await open("authenticated", u);
+      await cu.query(`select * from join_session($1, null, null, null)`, [live]);
+      await cu.query(`select * from join_session($1, null, null, null)`, [ended]);
+      await (await open("authenticated", other)).query(`select * from join_session($1, null, null, null)`, [live]);
+      await su.query(`update sessions set start_time = now() - interval '3 hours', end_time = now() - interval '1 hour' where id = $1`, [ended]);
+
+      const mp = await cu.query(`select * from get_my_participations()`);
+      assert.deepEqual(mp.rows.map((r) => r.session_id), [live], "only the caller's rows, only not-yet-ended sessions");
+      assert.ok(!("user_id" in mp.rows[0]), "never returns user ids");
+
+      await assert.rejects((await open("anon")).query(`select * from get_my_participations()`), /permission denied/i);
+      const g = await su.query(`select has_function_privilege('anon', 'get_my_participations()', 'EXECUTE') a,
+                                        has_function_privilege('authenticated', 'get_my_participations()', 'EXECUTE') b,
+                                        has_function_privilege('anon', 'get_session_roster(uuid)', 'EXECUTE') c`);
+      assert.deepEqual(g.rows[0], { a: false, b: true, c: true });
+    });
+  });
+
+  // =======================================================================
+  // SECTION — GUEST LIMITS (migration 029)
+  // =======================================================================
+
+  await t("guest_limits", "guest cap: at most ceil(capacity/2) active guests; registered users unaffected", async () => {
+    const v = await createVenue(su, organizerId);
+    const s = await createSession(su, organizerId, v, { capacity: 4 }); // cap = 2 guests
+    await withClients(async (open) => {
+      const g = await open("anon");
+      await g.query(`select * from join_session($1, $2, 'email', $3)`, [s, "Cap G1", "cap-g1@example.com"]);
+      await g.query(`select * from join_session($1, $2, 'email', $3)`, [s, "Cap G2", "cap-g2@example.com"]);
+      await assert.rejects(
+        g.query(`select * from join_session($1, $2, 'email', $3)`, [s, "Cap G3", "cap-g3@example.com"]),
+        /guest spots for this session are full/i
+      );
+      const reg = await createUser(su, { name: "Cap Registered" });
+      const r = await (await open("authenticated", reg)).query(`select * from join_session($1, null, null, null)`, [s]);
+      assert.equal(r.rows[0].status, "confirmed");
+    });
+  });
+
+  await t("guest_limits", "guest cap also bounds the waitlist (guests cannot flood it either)", async () => {
+    const v = await createVenue(su, organizerId);
+    const s = await createSession(su, organizerId, v, { sessionType: "singles", capacity: 2 }); // cap = 1
+    const a = await createUser(su, { name: "WL Cap A" });
+    const b = await createUser(su, { name: "WL Cap B" });
+    await withClients(async (open) => {
+      await (await open("authenticated", a)).query(`select * from join_session($1, null, null, null)`, [s]);
+      await (await open("authenticated", b)).query(`select * from join_session($1, null, null, null)`, [s]);
+      const g = await open("anon");
+      const r = await g.query(`select * from join_session($1, $2, 'email', $3)`, [s, "WL G1", "wl-g1@example.com"]);
+      assert.equal(r.rows[0].status, "waitlisted");
+      await assert.rejects(
+        g.query(`select * from join_session($1, $2, 'email', $3)`, [s, "WL G2", "wl-g2@example.com"]),
+        /guest spots for this session are full/i
+      );
+    });
+  });
+
+  await t("guest_limits", "guest rate limit: 6th guest sign-up in 10 minutes is rejected even if earlier guests left; allowed again after the window", async () => {
+    const v = await createVenue(su, organizerId);
+    const s = await createSession(su, organizerId, v, { capacity: 20 }); // cap 10 -- not the limiting factor
+    await withClients(async (open) => {
+      const g = await open("anon");
+      for (let i = 1; i <= 5; i++) {
+        const r = await g.query(`select * from join_session($1, $2, 'email', $3)`, [s, `Rate G${i}`, `rate-g${i}@example.com`]);
+        await g.query(`select leave_session($1, $2)`, [r.rows[0].participant_id, r.rows[0].management_token]);
+      }
+      await assert.rejects(
+        g.query(`select * from join_session($1, $2, 'email', $3)`, [s, "Rate G6", "rate-g6@example.com"]),
+        /too many guest sign-ups/i
+      );
+      await su.query(`update session_participants set created_at = now() - interval '11 minutes' where session_id = $1`, [s]);
+      const ok = await g.query(`select * from join_session($1, $2, 'email', $3)`, [s, "Rate G6", "rate-g6@example.com"]);
+      assert.equal(ok.rows[0].status, "confirmed");
+    });
+  });
+
+  await t("guest_limits", "guest input bounds: blank/oversized name and oversized contact are rejected", async () => {
+    const v = await createVenue(su, organizerId);
+    const s = await createSession(su, organizerId, v, { capacity: 20 });
+    await withClients(async (open) => {
+      const g = await open("anon");
+      await assert.rejects(g.query(`select * from join_session($1, $2, 'email', $3)`, [s, "   ", "blank@example.com"]), /between 1 and 80/i);
+      await assert.rejects(g.query(`select * from join_session($1, $2, 'email', $3)`, [s, "x".repeat(81), "long@example.com"]), /between 1 and 80/i);
+      await assert.rejects(
+        g.query(`select * from join_session($1, $2, 'email', $3)`, [s, "Long Contact", "a".repeat(250) + "@x.co"]),
+        /at most 254/i
+      );
+      const ok = await g.query(`select * from join_session($1, $2, 'email', $3)`, [s, "  Trimmed Name  ", "trim@example.com"]);
+      const row = await su.query(`select guest_name from session_participants where id = $1`, [ok.rows[0].participant_id]);
+      assert.equal(row.rows[0].guest_name, "Trimmed Name");
+    });
+  });
+
+  // =======================================================================
+  // SECTION — CAPACITY RECONCILIATION (migration 030)
+  // =======================================================================
+
+  await t("capacity", "decrease below occupied spots is rejected; capacity unchanged, nobody removed", async () => {
+    const v = await createVenue(su, organizerId);
+    const s = await createSession(su, organizerId, v, { capacity: 6 });
+    await withClients(async (open) => {
+      for (let i = 0; i < 5; i++) {
+        const u = await createUser(su, { name: `Dec${i}` });
+        await (await open("authenticated", u)).query(`select * from join_session($1, null, null, null)`, [s]);
+      }
+      const org = await open("authenticated", organizerId);
+      await assert.rejects(
+        org.query(`update sessions set capacity = 4 where id = $1`, [s]),
+        /capacity cannot be lower than the number of players holding a spot \(5\)/i
+      );
+      const cap = await su.query(`select capacity from sessions where id = $1`, [s]);
+      assert.equal(cap.rows[0].capacity, 6);
+      assert.equal(await occupiedCount(s), 5, "no confirmed player removed");
+    });
+  });
+
+  await t("capacity", "decrease to exactly the occupied count is allowed; next join goes to the waitlist", async () => {
+    const v = await createVenue(su, organizerId);
+    const s = await createSession(su, organizerId, v, { capacity: 6 });
+    await withClients(async (open) => {
+      for (let i = 0; i < 4; i++) {
+        const u = await createUser(su, { name: `DecOk${i}` });
+        await (await open("authenticated", u)).query(`select * from join_session($1, null, null, null)`, [s]);
+      }
+      await (await open("authenticated", organizerId)).query(`update sessions set capacity = 4 where id = $1`, [s]);
+      const late = await createUser(su, { name: "DecOk Late" });
+      const r = await (await open("authenticated", late)).query(`select * from join_session($1, null, null, null)`, [s]);
+      assert.equal(r.rows[0].status, "waitlisted");
+      assert.equal(await occupiedCount(s), 4);
+    });
+  });
+
+  await t("capacity", "increase promotes waitlisted players FIFO into exactly the new spots", async () => {
+    const v = await createVenue(su, organizerId);
+    const s = await createSession(su, organizerId, v, { sessionType: "singles", capacity: 2 });
+    await withClients(async (open) => {
+      for (let i = 0; i < 2; i++) {
+        const u = await createUser(su, { name: `IncF${i}` });
+        await (await open("authenticated", u)).query(`select * from join_session($1, null, null, null)`, [s]);
+      }
+      const waitIds = [];
+      for (let i = 0; i < 3; i++) {
+        const u = await createUser(su, { name: `IncW${i}` });
+        const r = await (await open("authenticated", u)).query(`select * from join_session($1, null, null, null)`, [s]);
+        waitIds.push(r.rows[0].participant_id);
+      }
+      await (await open("authenticated", organizerId)).query(`update sessions set capacity = 4 where id = $1`, [s]);
+      const st = await su.query(`select id, status from session_participants where id = any($1)`, [waitIds]);
+      const byId = Object.fromEntries(st.rows.map((r) => [r.id, r.status]));
+      assert.equal(byId[waitIds[0]], "pending_confirmation", "1st in line promoted");
+      assert.equal(byId[waitIds[1]], "pending_confirmation", "2nd in line promoted");
+      assert.equal(byId[waitIds[2]], "waitlisted", "3rd stays waitlisted");
+      assert.equal(await occupiedCount(s), 4);
+      const ob = await su.query(`select count(*) from notification_outbox where session_id = $1 and event_type = 'waitlist_promoted'`, [s]);
+      assert.equal(Number(ob.rows[0].count), 2, "one waitlist_promoted notification per promotion");
+      const r = await su.query(`select waitlist_position from get_session_roster($1) where participant_id = $2`, [s, waitIds[2]]);
+      assert.equal(r.rows[0].waitlist_position, 1, "remaining waiter is now first in line");
+    });
+  });
+
+  await t("capacity", "increase larger than the waitlist promotes only the waiting players (no phantom promotions)", async () => {
+    const v = await createVenue(su, organizerId);
+    const s = await createSession(su, organizerId, v, { sessionType: "singles", capacity: 2 });
+    await withClients(async (open) => {
+      for (let i = 0; i < 3; i++) {
+        const u = await createUser(su, { name: `Big${i}` });
+        await (await open("authenticated", u)).query(`select * from join_session($1, null, null, null)`, [s]);
+      }
+      await (await open("authenticated", organizerId)).query(`update sessions set capacity = 7 where id = $1`, [s]);
+      assert.equal(await occupiedCount(s), 3);
+      const w = await su.query(`select count(*) from session_participants where session_id = $1 and status = 'waitlisted'`, [s]);
+      assert.equal(Number(w.rows[0].count), 0);
+    });
+  });
+
+  await t("capacity", "increase on a cancelled or already-ended session promotes nobody", async () => {
+    const v = await createVenue(su, organizerId);
+    for (const kind of ["cancelled", "ended"]) {
+      const s = await createSession(su, organizerId, v, { sessionType: "singles", capacity: 2 });
+      await withClients(async (open) => {
+        for (let i = 0; i < 3; i++) {
+          const u = await createUser(su, { name: `${kind}${i}` });
+          await (await open("authenticated", u)).query(`select * from join_session($1, null, null, null)`, [s]);
+        }
+      });
+      if (kind === "cancelled") {
+        await su.query(`update sessions set status = 'cancelled', cancellation_reason = 'test' where id = $1`, [s]);
+      } else {
+        await su.query(`update sessions set start_time = now() - interval '3 hours', end_time = now() - interval '1 hour' where id = $1`, [s]);
+      }
+      await su.query(`update sessions set capacity = 4 where id = $1`, [s]);
+      const w = await su.query(`select count(*) from session_participants where session_id = $1 and status = 'waitlisted'`, [s]);
+      assert.equal(Number(w.rows[0].count), 1, `${kind}: waitlisted player must not be promoted`);
+    }
+  });
+
+  await t("capacity", "concurrent capacity increase + leave + join -> never over capacity, no duplicate promotions", async () => {
+    const v = await createVenue(su, organizerId);
+    const s = await createSession(su, organizerId, v, { sessionType: "singles", capacity: 2 });
+    await withClients(async (open) => {
+      const conf = [];
+      for (let i = 0; i < 2; i++) {
+        const u = await createUser(su, { name: `CcF${i}` });
+        const c = await open("authenticated", u);
+        const r = await c.query(`select * from join_session($1, null, null, null)`, [s]);
+        conf.push({ c, pid: r.rows[0].participant_id });
+      }
+      for (let i = 0; i < 4; i++) {
+        const u = await createUser(su, { name: `CcW${i}` });
+        await (await open("authenticated", u)).query(`select * from join_session($1, null, null, null)`, [s]);
+      }
+      const org = await open("authenticated", organizerId);
+      const newcomer = await open("authenticated", await createUser(su, { name: "CcNew" }));
+      await Promise.all([
+        org.query(`update sessions set capacity = 4 where id = $1`, [s]),
+        conf[0].c.query(`select leave_session($1, null)`, [conf[0].pid]),
+        newcomer.query(`select * from join_session($1, null, null, null)`, [s]),
+      ]);
+      const occ = await occupiedCount(s);
+      assert.equal(occ, 4, `capacity 4 must be exactly filled (enough waiters), got ${occ}`);
+      const ob = await su.query(
+        `select count(*) n, count(distinct user_id) d from notification_outbox where session_id = $1 and event_type = 'waitlist_promoted'`,
+        [s]
+      );
+      assert.equal(ob.rows[0].n, ob.rows[0].d, "no participant promoted twice");
+    });
+  });
+
+  await t("capacity", "concurrent capacity decrease vs join -> occupied never exceeds the final capacity", async () => {
+    for (let round = 0; round < 5; round++) {
+      const v = await createVenue(su, organizerId);
+      const s = await createSession(su, organizerId, v, { capacity: 4 });
+      await withClients(async (open) => {
+        for (let i = 0; i < 2; i++) {
+          const u = await createUser(su, { name: `CdF${round}${i}` });
+          await (await open("authenticated", u)).query(`select * from join_session($1, null, null, null)`, [s]);
+        }
+        const org = await open("authenticated", organizerId);
+        const joiner = await open("authenticated", await createUser(su, { name: `CdJ${round}` }));
+        await Promise.allSettled([
+          org.query(`update sessions set capacity = 2 where id = $1`, [s]),
+          joiner.query(`select * from join_session($1, null, null, null)`, [s]),
+        ]);
+        const cap = (await su.query(`select capacity from sessions where id = $1`, [s])).rows[0].capacity;
+        const occ = await occupiedCount(s);
+        assert.ok(occ <= cap, `round ${round}: occupied ${occ} > capacity ${cap}`);
+      });
+    }
+  });
+
+  // =======================================================================
   await su.end();
   printReport();
 }
@@ -1383,11 +1954,15 @@ function printReport() {
     "privacy",
     "attack",
     "concurrency",
+    "session_lifecycle",
     "reminders",
     "reports",
     "report_block_rpc",
     "constraints",
     "grants",
+    "my_roster",
+    "guest_limits",
+    "capacity",
   ];
   let pass = 0, fail = 0, blockedN = 0, notTested = 0;
   for (const cat of order) {

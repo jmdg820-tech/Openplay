@@ -1,0 +1,14 @@
+# Copy this file to android/key.properties (same directory) and fill in your
+# real production keystore details. android/key.properties is gitignored --
+# never commit it or the .jks/.keystore file it points to.
+#
+# Generate a keystore first, if you don't already have one, with:
+#   keytool -genkey -v -keystore <path-to-keystore>.jks -keyalg RSA -keysize 2048 -validity 10000 -alias <your-key-alias>
+#
+# storeFile is resolved relative to android/app/, so either use an absolute
+# path or a path starting with ../ (e.g. ../upload-keystore.jks).
+
+storeFile=../upload-keystore.jks
+storePassword=REPLACE_WITH_YOUR_KEYSTORE_PASSWORD
+keyAlias=REPLACE_WITH_YOUR_KEY_ALIAS
+keyPassword=REPLACE_WITH_YOUR_KEY_PASSWORD

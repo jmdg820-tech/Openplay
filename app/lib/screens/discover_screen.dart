@@ -3,7 +3,11 @@ import 'package:flutter/material.dart';
 import '../models/session.dart';
 import '../services/location_service.dart';
 import '../services/openplay_api.dart';
+import '../theme/app_spacing.dart';
+import '../utils/error_messages.dart';
 import '../utils/geo.dart';
+import '../widgets/app_state_views.dart';
+import '../widgets/pending_offer_banner.dart';
 import '../widgets/session_card.dart';
 import 'session_detail_screen.dart';
 
@@ -32,12 +36,34 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
   Map<String, GeoPoint?> _venueCoords = {};
   Map<String, String> _organizerNames = {};
   bool _loading = true;
-  String? _error;
+  Object? _error;
+
+  final _offerBannerKey = GlobalKey<PendingOfferBannerState>();
 
   @override
   void initState() {
     super.initState();
     _load();
+  }
+
+  Future<void> _openSession(Session s) async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => SessionDetailScreen(api: widget.api, session: s)),
+    );
+    _load();
+    _offerBannerKey.currentState?.refresh();
+  }
+
+  Future<void> _openSessionById(String sessionId) async {
+    try {
+      final s = await widget.api.getSession(sessionId);
+      if (mounted) await _openSession(s);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(friendlyActionError(e))));
+      }
+    }
   }
 
   (DateTime, DateTime) _range() {
@@ -82,7 +108,7 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
     } catch (e) {
       if (!mounted) return;
       setState(() {
-        _error = '$e';
+        _error = e;
         _loading = false;
       });
     }
@@ -145,17 +171,28 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
         });
     }
 
+    final isDesktop = MediaQuery.sizeOf(context).width >= AppBreakpoints.tablet;
+
     return Column(
       children: [
         Padding(
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+          padding: EdgeInsets.fromLTRB(
+            isDesktop ? 0 : AppSpacing.lg,
+            isDesktop ? AppSpacing.lg : AppSpacing.md,
+            isDesktop ? 0 : AppSpacing.lg,
+            AppSpacing.xs,
+          ),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text('Play today', style: Theme.of(context).textTheme.headlineSmall),
-              const SizedBox(height: 12),
+              PendingOfferBanner(key: _offerBannerKey, api: widget.api, onOpenSession: _openSessionById),
+              if (!isDesktop) ...[
+                Text('Play today', style: Theme.of(context).textTheme.headlineSmall),
+                const SizedBox(height: AppSpacing.md),
+              ],
               Wrap(
-                spacing: 8,
+                spacing: AppSpacing.sm,
+                runSpacing: AppSpacing.sm,
                 children: [
                   ChoiceChip(
                     label: const Text('Today'),
@@ -182,79 +219,115 @@ class _DiscoverScreenState extends State<DiscoverScreen> {
                     },
                   ),
                   ActionChip(
-                    avatar: const Icon(Icons.calendar_month, size: 16),
+                    avatar: const Icon(Icons.calendar_month_rounded, size: 16),
                     label: Text(_dateFilter == _DateFilter.custom && _customDate != null
                         ? '${_customDate!.year}-${_customDate!.month}-${_customDate!.day}'
                         : 'Pick date'),
                     onPressed: _pickCustomDate,
                   ),
-                ],
-              ),
-              const SizedBox(height: 8),
-              Row(
-                children: [
-                  Switch(
-                    value: _nearbyOnly,
-                    onChanged: _locating ? null : _toggleNearby,
+                  const SizedBox(width: AppSpacing.sm),
+                  FilterChip(
+                    avatar: _locating
+                        ? const SizedBox(
+                            width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
+                        : const Icon(Icons.near_me_rounded, size: 16),
+                    label: const Text('Nearby (25 km)'),
+                    selected: _nearbyOnly,
+                    onSelected: _locating ? null : _toggleNearby,
                   ),
-                  const Text('Nearby only (25 km)'),
-                  if (_locating) ...[
-                    const SizedBox(width: 8),
-                    const SizedBox(
-                        width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)),
-                  ],
                 ],
               ),
             ],
           ),
         ),
-        const Divider(height: 1),
+        const SizedBox(height: AppSpacing.sm),
+        if (!isDesktop) const Divider(height: 1),
         Expanded(
           child: RefreshIndicator(
             onRefresh: _load,
             child: _loading
-                ? const Center(child: CircularProgressIndicator())
+                ? const LoadingStateView(message: 'Finding sessions…')
                 : _error != null
-                    ? ListView(children: [
-                        Padding(
-                          padding: const EdgeInsets.all(24),
-                          child: Text('Could not load sessions: $_error'),
-                        )
-                      ])
+                    ? SingleChildScrollView(
+                        physics: const AlwaysScrollableScrollPhysics(),
+                        child: ErrorStateView(
+                          message: friendlyActionError(_error!),
+                          onRetry: _load,
+                        ),
+                      )
                     : visible.isEmpty
-                        ? ListView(children: const [
-                            Padding(
-                              padding: EdgeInsets.all(32),
-                              child: Center(
-                                child: Text('No open-play sessions match this filter yet.'),
-                              ),
+                        ? SingleChildScrollView(
+                            physics: const AlwaysScrollableScrollPhysics(),
+                            child: EmptyStateView(
+                              icon: Icons.sports_tennis_rounded,
+                              title: 'No sessions match this filter yet',
+                              message: _nearbyOnly
+                                  ? 'Try a wider date range, or turn off "Nearby" to see more.'
+                                  : 'Try a different date, or check back soon.',
                             ),
-                          ])
-                        : ListView.builder(
-                            padding: const EdgeInsets.symmetric(horizontal: 16),
-                            itemCount: visible.length,
-                            itemBuilder: (context, i) {
-                              final s = visible[i];
-                              return SessionCard(
-                                session: s,
-                                venueName: _venueNames[s.venueId] ?? 'Unknown venue',
-                                organizerName: _organizerNames[s.createdBy] ?? 'Unknown organizer',
-                                distanceKm: distances[s.id],
-                                onTap: () async {
-                                  await Navigator.push(
-                                    context,
-                                    MaterialPageRoute(
-                                      builder: (_) => SessionDetailScreen(api: widget.api, session: s),
-                                    ),
-                                  );
-                                  _load();
-                                },
-                              );
-                            },
+                          )
+                        : _SessionResults(
+                            sessions: visible,
+                            venueNames: _venueNames,
+                            organizerNames: _organizerNames,
+                            distances: distances,
+                            isDesktop: isDesktop,
+                            onOpen: _openSession,
                           ),
           ),
         ),
       ],
     );
   }
+}
+
+class _SessionResults extends StatelessWidget {
+  const _SessionResults({
+    required this.sessions,
+    required this.venueNames,
+    required this.organizerNames,
+    required this.distances,
+    required this.isDesktop,
+    required this.onOpen,
+  });
+
+  final List<Session> sessions;
+  final Map<String, String> venueNames;
+  final Map<String, String> organizerNames;
+  final Map<String, double> distances;
+  final bool isDesktop;
+  final ValueChanged<Session> onOpen;
+
+  @override
+  Widget build(BuildContext context) {
+    if (!isDesktop) {
+      return ListView.builder(
+        padding: const EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.sm, AppSpacing.lg, AppSpacing.xl),
+        itemCount: sessions.length,
+        itemBuilder: (context, i) => Padding(
+          padding: const EdgeInsets.only(bottom: AppSpacing.md),
+          child: _card(sessions[i]),
+        ),
+      );
+    }
+    return GridView.builder(
+      padding: const EdgeInsets.only(bottom: AppSpacing.xxl),
+      gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+        maxCrossAxisExtent: 420,
+        mainAxisExtent: 190,
+        crossAxisSpacing: AppSpacing.lg,
+        mainAxisSpacing: AppSpacing.lg,
+      ),
+      itemCount: sessions.length,
+      itemBuilder: (context, i) => _card(sessions[i]),
+    );
+  }
+
+  Widget _card(Session s) => SessionCard(
+        session: s,
+        venueName: venueNames[s.venueId] ?? 'Unknown venue',
+        organizerName: organizerNames[s.createdBy] ?? 'Unknown organizer',
+        distanceKm: distances[s.id],
+        onTap: () => onOpen(s),
+      );
 }

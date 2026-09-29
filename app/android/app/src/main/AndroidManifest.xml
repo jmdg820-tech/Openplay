@@ -1,4 +1,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Required in release builds to reach the Supabase API. The Flutter
+         template only declares this in the debug/profile manifests, so
+         without it here a release APK/AAB has no network access at all. -->
+    <uses-permission android:name="android.permission.INTERNET"/>
     <application
         android:label="openplay_app"
         android:name="${applicationName}"

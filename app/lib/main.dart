@@ -5,6 +5,9 @@ import 'config.dart';
 import 'screens/auth_screen.dart';
 import 'screens/home_shell.dart';
 import 'services/openplay_api.dart';
+import 'theme/app_colors.dart';
+import 'theme/app_spacing.dart';
+import 'theme/app_theme.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -24,7 +27,7 @@ class OpenPlayApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'OpenPlay',
-      theme: ThemeData(colorSchemeSeed: const Color(0xFF1E6F5C), useMaterial3: true),
+      theme: AppTheme.light,
       home: AppConfig.isConfigured ? const AuthGate() : const _NotConfiguredScreen(),
     );
   }
@@ -38,16 +41,36 @@ class _NotConfiguredScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const Scaffold(
+    final theme = Theme.of(context);
+    return Scaffold(
       body: Center(
         child: Padding(
-          padding: EdgeInsets.all(24),
-          child: Text(
-            'OpenPlay is not configured.\n\n'
-            'Run with:\n'
-            '  --dart-define=SUPABASE_URL=<url>\n'
-            '  --dart-define=SUPABASE_ANON_KEY=<anon key>',
-            textAlign: TextAlign.center,
+          padding: const EdgeInsets.all(AppSpacing.xxl),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 64,
+                height: 64,
+                decoration: const BoxDecoration(color: AppColors.courtTealPale, shape: BoxShape.circle),
+                child: const Icon(Icons.settings_outlined, size: 28, color: AppColors.courtTealDeep),
+              ),
+              const SizedBox(height: AppSpacing.lg),
+              Text('OpenPlay is not configured', style: theme.textTheme.titleMedium),
+              const SizedBox(height: AppSpacing.sm),
+              Container(
+                padding: const EdgeInsets.all(AppSpacing.md),
+                decoration: BoxDecoration(
+                  color: AppColors.ink,
+                  borderRadius: BorderRadius.circular(AppRadius.md),
+                ),
+                child: const Text(
+                  '--dart-define=SUPABASE_URL=<url>\n'
+                  '--dart-define=SUPABASE_ANON_KEY=<anon key>',
+                  style: TextStyle(color: AppColors.white, fontFamily: 'monospace', fontSize: 12),
+                ),
+              ),
+            ],
           ),
         ),
       ),

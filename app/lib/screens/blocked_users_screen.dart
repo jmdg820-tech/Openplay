@@ -2,6 +2,10 @@ import 'package:flutter/material.dart';
 
 import '../models/public_profile.dart';
 import '../services/openplay_api.dart';
+import '../theme/app_spacing.dart';
+import '../utils/error_messages.dart';
+import '../widgets/app_state_views.dart';
+import '../widgets/initials_avatar.dart';
 
 /// Lightweight moderation surface: the registered user's own blocks
 /// (`blocks_select_own` -- never who blocked *them*, see the security
@@ -30,7 +34,14 @@ class _BlockedUsersScreenState extends State<BlockedUsersScreen> {
     return widget.api.getPublicProfiles(ids);
   }
 
-  void _refresh() => setState(() => _blockedFuture = _load());
+  void _refresh() {
+    // Same fix as venue_list_screen.dart's _refresh(): a block body, not an
+    // arrow-expression assignment, so the setState callback's inferred
+    // return type is void rather than the Future _load() assigns.
+    setState(() {
+      _blockedFuture = _load();
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -40,26 +51,49 @@ class _BlockedUsersScreenState extends State<BlockedUsersScreen> {
         future: _blockedFuture,
         builder: (context, snapshot) {
           if (snapshot.connectionState != ConnectionState.done) {
-            return const Center(child: CircularProgressIndicator());
+            return const LoadingStateView();
           }
-          if (snapshot.hasError) return Center(child: Text('Failed to load: ${snapshot.error}'));
+          if (snapshot.hasError) {
+            return ErrorStateView(message: friendlyActionError(snapshot.error!), onRetry: _refresh);
+          }
           final blocked = snapshot.data!.values.toList();
           if (blocked.isEmpty) {
-            return const Center(child: Text("You haven't blocked anyone."));
+            return const EmptyStateView(
+              icon: Icons.shield_outlined,
+              title: "You haven't blocked anyone",
+              message: 'People you block from a session will show up here.',
+            );
           }
-          return ListView(
-            children: blocked
-                .map((p) => ListTile(
-                      title: Text(p.name),
-                      trailing: TextButton(
-                        onPressed: () async {
-                          await widget.api.unblockUser(p.id);
-                          _refresh();
-                        },
-                        child: const Text('Unblock'),
-                      ),
-                    ))
-                .toList(),
+          return ListView.builder(
+            padding: const EdgeInsets.all(AppSpacing.lg),
+            itemCount: blocked.length,
+            itemBuilder: (context, i) {
+              final p = blocked[i];
+              return Padding(
+                padding: const EdgeInsets.only(bottom: AppSpacing.sm),
+                child: Card(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: AppSpacing.lg, vertical: AppSpacing.sm),
+                    child: Row(
+                      children: [
+                        InitialsAvatar(p.name, muted: true),
+                        const SizedBox(width: AppSpacing.md),
+                        Expanded(
+                          child: Text(p.name, style: Theme.of(context).textTheme.bodyLarge),
+                        ),
+                        TextButton(
+                          onPressed: () async {
+                            await widget.api.unblockUser(p.id);
+                            _refresh();
+                          },
+                          child: const Text('Unblock'),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            },
           );
         },
       ),

@@ -2,6 +2,7 @@
 // our OpenPlay session model) -- we never need gotrue's Session here.
 import 'package:supabase_flutter/supabase_flutter.dart' hide Session;
 
+import '../models/my_participation.dart';
 import '../models/public_profile.dart';
 import '../models/roster_entry.dart';
 import '../models/session.dart';
@@ -208,6 +209,14 @@ class OpenPlayApi {
   Future<List<RosterEntry>> getSessionRoster(String sessionId) async {
     final rows = await _client.rpc('get_session_roster', params: {'p_session_id': sessionId});
     return (rows as List).cast<Map<String, dynamic>>().map(RosterEntry.fromRow).toList();
+  }
+
+  /// The signed-in user's own active registrations (migration 028). Powers
+  /// the in-app "you've been offered a spot" banner and My sessions. Only
+  /// ever the caller's rows -- identity is auth.uid() server-side.
+  Future<List<MyParticipation>> getMyParticipations() async {
+    final rows = await _client.rpc('get_my_participations');
+    return (rows as List).cast<Map<String, dynamic>>().map(MyParticipation.fromRow).toList();
   }
 
   // ---------------------------------------------------------------------

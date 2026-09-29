@@ -144,6 +144,56 @@ not faked; both functions are independently callable/testable right now.
 
 ## Migrations
 
-See `supabase/migrations/` for the full, numbered migration set (21 files as
-of this writing). No migration has been applied to any remote/production
-Supabase project — all execution is against a local test environment only.
+See `supabase/migrations/` for the full, numbered migration set (30 files as
+of 2026-09-26).
+
+**Production state (verified 2026-09-26, read-only):** the objects from
+001–027 exist in the live project, and `pg_cron` runs both sweeps
+(migration 024). Only 025–027 are recorded in
+`supabase_migrations.schema_migrations`, and under MCP-assigned versions
+(`20260911121145`, `20260923065505`, `20260923065517`), not the filenames'
+`20260910000025…27`.
+
+**Consequence:** `supabase db push` would treat every local file as
+unapplied and try to replay them. Do not run it until the history is
+reconciled:
+1. Verify schema equivalence.
+2. `supabase migration repair --status applied 20260910000001` … `…027`.
+3. `supabase migration repair --status reverted` for the three
+   MCP-assigned versions.
+
+Until then, apply new migrations individually through the same MCP
+`apply_migration` path used for 025–027.
+
+**Migrations 028–030 are NOT yet applied to production.**
+
+## Post-audit fixes (migrations 028–030)
+
+- **028 — your own roster row.** `get_session_roster()` gains `is_self` and
+  `waitlist_position`.
+  - `is_self` is true only for the caller's own registered row, derived from
+    `auth.uid()`.
+  - `waitlist_position` is the 1-based FIFO position among waitlisted rows.
+  - The client drives Leave/Confirm from `is_self`, so they survive
+    navigation and restarts. Guests still prove ownership with their token.
+  - New `get_my_participations()` (authenticated only, caller's rows only)
+    powers the in-app "you've been offered a spot" banner and My sessions.
+    This is the in-app delivery path for `waitlist_promoted`.
+  - **Off-app push is still not implemented.** It needs a provider and
+    credentials (FCM/APNs, Windows push, or email/SMTP).
+    `notification_outbox` rows remain undelivered off-app.
+- **029 — guest limits in `join_session()`.** These apply to the guest path
+  only; registered users are unaffected. Limits are checked under the
+  session row lock:
+  - active guests per session are capped at `ceil(capacity / 2)`
+    (the waitlist counts too);
+  - at most 5 guest sign-ups per session per rolling 10 minutes;
+  - `guest_name` 1–80 characters (stored trimmed); contact at most 254
+    characters.
+- **030 — capacity reconciliation (triggers on `sessions`).**
+  - Lowering capacity below the occupied spots (confirmed + pending) is
+    rejected.
+  - Raising capacity on an active, not-yet-ended session promotes waitlisted
+    players FIFO through the unchanged `promote_next_waitlisted()`.
+  - Both triggers run under the sessions row lock that every other
+    capacity-sensitive path takes.

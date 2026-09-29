@@ -1,0 +1,4 @@
+tags:
+  # test/visual_qa: golden-screenshot harness for manual UI review (see
+  # that file). Excluded from the release gate.
+  visual-qa:

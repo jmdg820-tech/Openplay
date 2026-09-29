@@ -4,10 +4,15 @@ import 'package:flutter/material.dart';
 
 import '../models/roster_entry.dart';
 import '../models/session.dart';
+import '../models/venue.dart';
 import '../services/openplay_api.dart';
+import '../theme/app_colors.dart';
+import '../theme/app_spacing.dart';
 import '../utils/error_messages.dart';
 import '../utils/roster_actions.dart';
+import '../widgets/app_state_views.dart';
 import '../widgets/countdown_text.dart';
+import '../widgets/initials_avatar.dart';
 import '../widgets/status_badge.dart';
 
 class SessionDetailScreen extends StatefulWidget {
@@ -24,12 +29,19 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
   late Session _session;
   List<RosterEntry>? _roster;
   Object? _rosterError;
+  late Future<Venue> _venueFuture;
 
-  /// Participant ids the current user manages in this session (their own
-  /// registered participant row, or guest rows whose management_token this
-  /// device captured at join time). Never derived from the roster itself
-  /// (which never carries user_id) -- only from this client's own actions.
-  final Map<String, String?> _myParticipants = {}; // participantId -> managementToken
+  /// Rows this screen instance knows it manages: participantId ->
+  /// management_token. Mainly GUEST rows (token captured at guest-join time
+  /// or re-entered from a saved guest code); a registered join is also noted
+  /// with a null token as a same-screen fallback. Ownership of registered
+  /// rows is primarily the server's `is_self` on every roster fetch (see
+  /// isMyEntry()), which is what keeps Leave/Confirm available after
+  /// navigating away or restarting -- this map is never relied on for that.
+  final Map<String, String?> _myParticipants = {};
+
+  /// Guards Leave/Confirm against double taps while a request is in flight.
+  bool _actionInFlight = false;
 
   Timer? _pollTimer;
   StreamSubscription<List<Map<String, dynamic>>>? _sessionSub;
@@ -38,6 +50,7 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
   void initState() {
     super.initState();
     _session = widget.session;
+    _venueFuture = widget.api.getVenue(_session.venueId);
     _refreshRoster();
     // Roster changes (new joins, waitlist promotion, leaves) are never
     // pushed -- get_session_roster() is the sole read surface and it is a
@@ -81,13 +94,20 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
   Future<void> _joinAsSelf() async {
     try {
       final result = await widget.api.joinAsSelf(_session.id);
+      // Same-screen fallback only (null token = registered row). With
+      // migration 028 the server's is_self already covers this and also
+      // survives navigation/restarts; without it (a backend not yet
+      // migrated) this keeps Leave available right after joining, exactly
+      // as before the fix -- never worse.
       _myParticipants[result.participantId] = null;
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('Joined — status: ${result.status}')));
+        final message = result.status == 'waitlisted'
+            ? "This session is full -- you're on the waitlist."
+            : "You're in!";
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
       }
     } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Join failed: $e')));
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Join failed: ${friendlyActionError(e)}')));
     }
     _refreshRoster();
   }
@@ -140,7 +160,7 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
         await _showTokenOnce(result.participantId, result.managementToken!);
       }
     } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Join failed: $e')));
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Join failed: ${friendlyActionError(e)}')));
     }
     _refreshRoster();
   }
@@ -253,32 +273,42 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
   }
 
   Future<void> _leave(RosterEntry entry) async {
+    if (_actionInFlight) return;
+    setState(() => _actionInFlight = true);
     final token = _myParticipants[entry.participantId];
     try {
       await widget.api.leaveSession(entry.participantId, managementToken: token);
     } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Leave failed: $e')));
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Leave failed: ${friendlyActionError(e)}')));
     }
-    _refreshRoster();
+    await _refreshRoster();
+    if (mounted) setState(() => _actionInFlight = false);
   }
 
   Future<void> _confirmPromotion(RosterEntry entry) async {
+    if (_actionInFlight) return;
+    setState(() => _actionInFlight = true);
     final token = _myParticipants[entry.participantId];
     try {
       await widget.api.confirmPromotion(entry.participantId, managementToken: token);
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(const SnackBar(content: Text("Spot confirmed -- you're in!")));
+      }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Confirm failed: $e')));
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Confirm failed: ${friendlyActionError(e)}')));
       }
     }
-    _refreshRoster();
+    await _refreshRoster();
+    if (mounted) setState(() => _actionInFlight = false);
   }
 
   Future<void> _removeAsOrganizer(RosterEntry entry) async {
     try {
       await widget.api.removeParticipant(entry.participantId);
     } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Remove failed: $e')));
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Remove failed: ${friendlyActionError(e)}')));
     }
     _refreshRoster();
   }
@@ -310,7 +340,7 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
       if (mounted) setState(() => _session = updated);
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Cancel failed: $e')));
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Cancel failed: ${friendlyActionError(e)}')));
       }
     }
   }
@@ -374,7 +404,7 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
       final updated = await widget.api.getSession(_session.id);
       if (mounted) setState(() => _session = updated);
     } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Save failed: $e')));
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Save failed: ${friendlyActionError(e)}')));
     }
   }
 
@@ -511,13 +541,19 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     final roster = _roster;
     final confirmedCount = roster?.where((r) => r.status == 'confirmed').length ?? 0;
     final waitlistedCount = roster?.where((r) => r.status == 'waitlisted').length ?? 0;
+    // Pending offers hold a spot too -- same rule the server applies.
+    final isFull = occupiedSpots(roster ?? const []) >= _session.capacity;
+    final alreadyJoined = hasActiveSelfEntry(roster ?? const []);
 
     return Scaffold(
       appBar: AppBar(
-        title: Text('${_session.sessionType} session'),
+        title: Text(
+          '${_session.sessionType[0].toUpperCase()}${_session.sessionType.substring(1)} session',
+        ),
         actions: [
           if (_isOrganizer && !_session.isCancelled) ...[
             IconButton(icon: const Icon(Icons.edit), tooltip: 'Edit session', onPressed: _editSession),
@@ -553,7 +589,10 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
                     // either a real auth.uid() or guest fields; an anonymous
                     // browser tapping "Join" here would just get a
                     // guest-fields-required error, so don't offer it.
-                    if (widget.api.isSignedIn)
+                    // Hidden once the server reports the viewer already
+                    // holds an active registration (is_self) -- a second
+                    // join would only be rejected with "already joined".
+                    if (widget.api.isSignedIn && !alreadyJoined)
                       ListTile(
                         leading: const Icon(Icons.person),
                         title: const Text('Join'),
@@ -587,34 +626,46 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
       body: RefreshIndicator(
         onRefresh: _refreshRoster,
         child: ListView(
-          padding: const EdgeInsets.all(16),
+          padding: const EdgeInsets.fromLTRB(AppSpacing.lg, AppSpacing.lg, AppSpacing.lg, AppSpacing.xxxl + 64),
           children: [
-            Text('${_session.startTime.toLocal()} → ${_session.endTime.toLocal()}'),
-            const SizedBox(height: 4),
-            Text('Capacity: $confirmedCount / ${_session.capacity} joined'
-                '${waitlistedCount > 0 ? '  •  $waitlistedCount waitlisted' : ''}'),
-            if (_session.skillLevelInfo != null) Text('Skill: ${_session.skillLevelInfo}'),
-            if (_session.isCancelled)
-              Padding(
-                padding: const EdgeInsets.only(top: 8),
-                child: Text('CANCELLED: ${_session.cancellationReason ?? ''}',
-                    style: TextStyle(color: Theme.of(context).colorScheme.error, fontWeight: FontWeight.bold)),
-              ),
-            const Divider(height: 32),
-            Text('Roster', style: Theme.of(context).textTheme.titleMedium),
-            const SizedBox(height: 8),
-            if (_rosterError != null) Text('Failed to load roster: $_rosterError'),
-            if (roster == null)
+            if (_session.isCancelled) ...[
+              _CancelledBanner(reason: _session.cancellationReason),
+              const SizedBox(height: AppSpacing.lg),
+            ],
+            _SessionInfoCard(
+              session: _session,
+              venueFuture: _venueFuture,
+              confirmedCount: confirmedCount,
+              waitlistedCount: waitlistedCount,
+              isFull: isFull,
+            ),
+            const SizedBox(height: AppSpacing.xl),
+            Row(
+              children: [
+                Text('Roster', style: theme.textTheme.headlineSmall),
+                const SizedBox(width: AppSpacing.sm),
+                if (roster != null)
+                  Text('(${roster.length})', style: theme.textTheme.bodyMedium?.copyWith(color: AppColors.slate)),
+              ],
+            ),
+            const SizedBox(height: AppSpacing.md),
+            if (_rosterError != null)
+              ErrorStateView(message: friendlyActionError(_rosterError!), onRetry: _refreshRoster)
+            else if (roster == null)
               const Padding(
-                padding: EdgeInsets.all(24),
-                child: Center(child: CircularProgressIndicator()),
+                padding: EdgeInsets.symmetric(vertical: AppSpacing.xxl),
+                child: LoadingStateView(),
               )
             else if (roster.isEmpty)
-              const Text('No one has joined yet.')
+              const EmptyStateView(
+                icon: Icons.groups_outlined,
+                title: 'No one has joined yet',
+                message: 'Be the first -- tap Join below.',
+              )
             else
               Column(
                 children: roster.map((entry) {
-                  final isMine = _myParticipants.containsKey(entry.participantId);
+                  final isMine = isMyEntry(entry, _myParticipants);
                   // See utils/roster_actions.dart for exactly why this is a
                   // deny-list on isGuest==true rather than an allow-list on
                   // isGuest==false: an ordinary joined participant is never
@@ -626,61 +677,300 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
                     isMine: isMine,
                     isSignedIn: widget.api.isSignedIn,
                   );
-                  return Card(
-                    child: ListTile(
-                      leading: Icon(entry.isGuest == true ? Icons.person_outline : Icons.person),
-                      title: Text(entry.displayName),
-                      subtitle: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              StatusBadge(entry.status),
-                              if (entry.skillLevel != null) ...[
-                                const SizedBox(width: 6),
-                                Text(entry.skillLevel!),
-                              ],
-                            ],
-                          ),
-                          if (entry.secondsUntilExpiry != null)
-                            CountdownText(seconds: entry.secondsUntilExpiry!),
-                        ],
-                      ),
-                      isThreeLine: entry.secondsUntilExpiry != null,
-                      trailing: Wrap(
-                        spacing: 4,
-                        crossAxisAlignment: WrapCrossAlignment.center,
-                        children: [
-                          if (isMine && entry.status == 'pending_confirmation')
-                            FilledButton(
-                              onPressed: () => _confirmPromotion(entry),
-                              child: const Text('Confirm'),
-                            ),
-                          if (isMine)
-                            TextButton(onPressed: () => _leave(entry), child: const Text('Leave')),
-                          if (_isOrganizer && !isMine)
-                            IconButton(
-                              icon: const Icon(Icons.person_remove),
-                              tooltip: 'Remove (organizer/staff)',
-                              onPressed: () => _removeAsOrganizer(entry),
-                            ),
-                          if (showModeration)
-                            PopupMenuButton<String>(
-                              tooltip: 'Report or block',
-                              onSelected: (v) => v == 'report'
-                                  ? _reportParticipant(entry)
-                                  : _blockParticipant(entry),
-                              itemBuilder: (context) => const [
-                                PopupMenuItem(value: 'report', child: Text('Report')),
-                                PopupMenuItem(value: 'block', child: Text('Block')),
-                              ],
-                            ),
-                        ],
-                      ),
+                  return Padding(
+                    padding: const EdgeInsets.only(bottom: AppSpacing.sm),
+                    child: _RosterRow(
+                      entry: entry,
+                      isMine: isMine,
+                      canLeave: canLeave(entry, _myParticipants),
+                      canConfirm: canConfirm(entry, _myParticipants),
+                      actionsEnabled: !_actionInFlight,
+                      isOrganizer: _isOrganizer,
+                      showModeration: showModeration,
+                      onConfirm: () => _confirmPromotion(entry),
+                      onLeave: () => _leave(entry),
+                      onRemove: () => _removeAsOrganizer(entry),
+                      onReport: () => _reportParticipant(entry),
+                      onBlock: () => _blockParticipant(entry),
                     ),
                   );
                 }).toList(),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _SessionInfoCard extends StatelessWidget {
+  const _SessionInfoCard({
+    required this.session,
+    required this.venueFuture,
+    required this.confirmedCount,
+    required this.waitlistedCount,
+    required this.isFull,
+  });
+
+  final Session session;
+  final Future<Venue> venueFuture;
+  final int confirmedCount;
+  final int waitlistedCount;
+  final bool isFull;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(AppSpacing.xl),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Container(
+                  width: 48,
+                  height: 48,
+                  decoration: BoxDecoration(
+                    color: AppColors.courtTealPale,
+                    borderRadius: BorderRadius.circular(AppRadius.md),
+                  ),
+                  child: Icon(
+                    session.sessionType == 'singles' ? Icons.person_rounded : Icons.groups_2_rounded,
+                    color: AppColors.courtTealDeep,
+                    size: 24,
+                  ),
+                ),
+                const SizedBox(width: AppSpacing.md),
+                Expanded(
+                  child: FutureBuilder<Venue>(
+                    future: venueFuture,
+                    builder: (context, snapshot) => Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          '${session.sessionType[0].toUpperCase()}${session.sessionType.substring(1)} pickleball',
+                          style: theme.textTheme.titleLarge,
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          snapshot.data?.name ?? 'Loading venue…',
+                          style: theme.textTheme.bodyMedium?.copyWith(color: AppColors.slate),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                if (!session.isCancelled) StatusBadge(isFull ? 'full' : 'active'),
+              ],
+            ),
+            const SizedBox(height: AppSpacing.lg),
+            const Divider(height: 1),
+            const SizedBox(height: AppSpacing.lg),
+            Wrap(
+              spacing: AppSpacing.xl,
+              runSpacing: AppSpacing.md,
+              children: [
+                SessionStat(
+                  icon: Icons.schedule_rounded,
+                  label: 'When',
+                  value: '${_fmt(session.startTime)} – ${_fmtTime(session.endTime)}',
+                ),
+                SessionStat(
+                  icon: Icons.groups_rounded,
+                  label: 'Players',
+                  value: '$confirmedCount / ${session.capacity} joined'
+                      '${waitlistedCount > 0 ? ' · $waitlistedCount waiting' : ''}',
+                ),
+                if (session.skillLevelInfo != null)
+                  SessionStat(icon: Icons.bar_chart_rounded, label: 'Skill level', value: session.skillLevelInfo!),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  static String _fmtTime(DateTime t) {
+    final l = t.toLocal();
+    return '${l.hour.toString().padLeft(2, '0')}:${l.minute.toString().padLeft(2, '0')}';
+  }
+
+  static String _fmt(DateTime t) {
+    final l = t.toLocal();
+    return '${l.year}-${l.month.toString().padLeft(2, '0')}-${l.day.toString().padLeft(2, '0')} ${_fmtTime(t)}';
+  }
+}
+
+class SessionStat extends StatelessWidget {
+  const SessionStat({super.key, required this.icon, required this.label, required this.value});
+  final IconData icon;
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return ConstrainedBox(
+      constraints: const BoxConstraints(minWidth: 140),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 18, color: AppColors.slate),
+          const SizedBox(width: AppSpacing.sm),
+          Flexible(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(label, style: theme.textTheme.labelSmall),
+                Text(value, style: theme.textTheme.bodyMedium, maxLines: 1, overflow: TextOverflow.ellipsis),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _CancelledBanner extends StatelessWidget {
+  const _CancelledBanner({required this.reason});
+  final String? reason;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(AppSpacing.lg),
+      decoration: BoxDecoration(
+        color: AppColors.statusCancelledBg,
+        borderRadius: BorderRadius.circular(AppRadius.lg),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.event_busy_rounded, color: AppColors.statusCancelled),
+          const SizedBox(width: AppSpacing.md),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text('This session was cancelled',
+                    style: Theme.of(context)
+                        .textTheme
+                        .titleSmall
+                        ?.copyWith(color: AppColors.statusCancelled)),
+                if (reason != null && reason!.isNotEmpty)
+                  Text(reason!, style: Theme.of(context).textTheme.bodySmall),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _RosterRow extends StatelessWidget {
+  const _RosterRow({
+    required this.entry,
+    required this.isMine,
+    required this.canLeave,
+    required this.canConfirm,
+    required this.actionsEnabled,
+    required this.isOrganizer,
+    required this.showModeration,
+    required this.onConfirm,
+    required this.onLeave,
+    required this.onRemove,
+    required this.onReport,
+    required this.onBlock,
+  });
+
+  final RosterEntry entry;
+  final bool isMine;
+  final bool canLeave;
+  final bool canConfirm;
+  final bool actionsEnabled;
+  final bool isOrganizer;
+  final bool showModeration;
+  final VoidCallback onConfirm;
+  final VoidCallback onLeave;
+  final VoidCallback onRemove;
+  final VoidCallback onReport;
+  final VoidCallback onBlock;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(AppSpacing.md),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            InitialsAvatar(entry.displayName, muted: entry.isGuest == true),
+            const SizedBox(width: AppSpacing.md),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Row(
+                    children: [
+                      Flexible(
+                        child: Text(entry.displayName,
+                            style: theme.textTheme.titleMedium, overflow: TextOverflow.ellipsis),
+                      ),
+                      if (isMine) ...[
+                        const SizedBox(width: AppSpacing.xs),
+                        Text('(you)', style: theme.textTheme.bodySmall),
+                      ],
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  Wrap(
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    spacing: AppSpacing.sm,
+                    runSpacing: 4,
+                    children: [
+                      StatusBadge(entry.status, dense: true),
+                      if (isMine && entry.waitlistPosition != null)
+                        Text('#${entry.waitlistPosition} in line', style: theme.textTheme.bodySmall),
+                      if (entry.skillLevel != null)
+                        Text(entry.skillLevel!, style: theme.textTheme.bodySmall),
+                    ],
+                  ),
+                  if (entry.secondsUntilExpiry != null) ...[
+                    const SizedBox(height: 4),
+                    CountdownText(seconds: entry.secondsUntilExpiry!),
+                  ],
+                ],
+              ),
+            ),
+            if (canConfirm)
+              FilledButton(onPressed: actionsEnabled ? onConfirm : null, child: const Text('Confirm')),
+            if (canLeave)
+              TextButton(onPressed: actionsEnabled ? onLeave : null, child: const Text('Leave')),
+            if (isOrganizer && !isMine)
+              IconButton(
+                icon: const Icon(Icons.person_remove_outlined),
+                tooltip: 'Remove (organizer/staff)',
+                onPressed: onRemove,
+              ),
+            if (showModeration)
+              PopupMenuButton<String>(
+                tooltip: 'Report or block',
+                onSelected: (v) => v == 'report' ? onReport() : onBlock(),
+                itemBuilder: (context) => const [
+                  PopupMenuItem(value: 'report', child: Text('Report')),
+                  PopupMenuItem(value: 'block', child: Text('Block')),
+                ],
               ),
           ],
         ),

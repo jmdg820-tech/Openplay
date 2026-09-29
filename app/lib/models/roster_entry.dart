@@ -1,4 +1,5 @@
-/// Mirrors the exact, and ONLY, columns `get_session_roster()` returns.
+/// Mirrors the exact, and ONLY, columns `get_session_roster()` returns
+/// (including `is_self`/`waitlist_position` from migration 028).
 /// There is deliberately no `userId`, `guestName`, `guestContact`,
 /// `managementToken`, `waitlistOrderAt`, `promotedAt`, `promotionExpiresAt`,
 /// `joinedAt`, or `createdAt`/`updatedAt` field here — the RPC never sends
@@ -17,6 +18,16 @@ class RosterEntry {
   /// "unknown" instead of implying "definitely registered".
   final bool? isGuest;
 
+  /// True only for the signed-in caller's own registered row (migration
+  /// 028). Server-derived from auth.uid(), so it survives navigation and app
+  /// restarts. Defaults to false when absent (an older backend without
+  /// migration 028) -- never true by guesswork.
+  final bool isSelf;
+
+  /// 1-based FIFO position among waitlisted rows; null for other statuses
+  /// (or an older backend).
+  final int? waitlistPosition;
+
   RosterEntry({
     required this.participantId,
     required this.sessionId,
@@ -25,6 +36,8 @@ class RosterEntry {
     required this.skillLevel,
     required this.secondsUntilExpiry,
     required this.isGuest,
+    this.isSelf = false,
+    this.waitlistPosition,
   });
 
   factory RosterEntry.fromRow(Map<String, dynamic> row) => RosterEntry(
@@ -35,5 +48,7 @@ class RosterEntry {
         skillLevel: row['skill_level'] as String?,
         secondsUntilExpiry: row['seconds_until_expiry'] as int?,
         isGuest: row['is_guest'] as bool?,
+        isSelf: row['is_self'] == true,
+        waitlistPosition: row['waitlist_position'] as int?,
       );
 }

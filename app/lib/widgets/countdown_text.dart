@@ -52,11 +52,11 @@ class _CountdownTextState extends State<CountdownText> {
     final minutes = _remaining ~/ 60;
     final secs = _remaining % 60;
     final text = '${minutes}m ${secs.toString().padLeft(2, '0')}s left to confirm';
+    final theme = Theme.of(context);
     return Text(
       text,
-      style: TextStyle(
-        color: _remaining <= 60 ? Theme.of(context).colorScheme.error : null,
-        fontWeight: FontWeight.w600,
+      style: theme.textTheme.labelMedium?.copyWith(
+        color: _remaining <= 60 ? theme.colorScheme.error : theme.colorScheme.onSurfaceVariant,
       ),
     );
   }

@@ -1,8 +1,12 @@
 # Local dev database cluster (self-managed Postgres data directory, never committed)
 .devdb/
 
-# Claude session artifacts
+# Claude Code / AI-tooling artifacts (not OpenPlay project files)
 .claude/
+.agents/
+.mcp.json
+skills-lock.json
+.playwright-mcp/
 
 # Node
 node_modules/
@@ -19,6 +23,23 @@ build/
 .env.*
 *.pem
 
+# Android release signing (never commit keystores or their credentials)
+app/android/key.properties
+*.jks
+*.keystore
+
+# Electron desktop shell (OpenPlay Windows distribution) build/package output
+# -- uses desktop/resources/ (not desktop/build/) for tracked assets like the
+# icon, specifically to avoid colliding with the generic build/ ignore above.
+desktop/release/
+desktop/dist/
+desktop/webapp/
+
 # OS
 .DS_Store
 Thumbs.db
+
+# Ad-hoc QA screenshots at the repo root
+/*.png
+# Golden-test diff output (regenerated on failure)
+app/test/visual_qa/failures/

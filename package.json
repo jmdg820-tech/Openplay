@@ -1,0 +1,9 @@
+{
+  "name": "openplay",
+  "private": true,
+  "description": "OpenPlay release tooling. App code lives in app/ (Flutter) and desktop/ (Electron shell).",
+  "scripts": {
+    "release": "node scripts/release.mjs",
+    "release:preflight": "node scripts/release.mjs --preflight-only"
+  }
+}

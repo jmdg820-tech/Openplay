@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:openplay_app/models/my_participation.dart';
 import 'package:openplay_app/models/public_profile.dart';
 import 'package:openplay_app/models/roster_entry.dart';
 import 'package:openplay_app/models/session.dart';
@@ -23,6 +24,22 @@ void main() {
       expect(entry.skillLevel, 'advanced');
       expect(entry.secondsUntilExpiry, isNull);
       expect(entry.isGuest, false);
+    });
+
+    test('parses is_self and waitlist_position (migration 028)', () {
+      final entry = RosterEntry.fromRow({
+        'participant_id': 'p1',
+        'session_id': 's1',
+        'display_name': 'Me',
+        'status': 'waitlisted',
+        'skill_level': null,
+        'seconds_until_expiry': null,
+        'is_guest': null,
+        'is_self': true,
+        'waitlist_position': 3,
+      });
+      expect(entry.isSelf, isTrue);
+      expect(entry.waitlistPosition, 3);
     });
 
     test('keeps is_guest as a real null (server-hidden) rather than defaulting to false', () {
@@ -117,6 +134,53 @@ void main() {
         'location': '0101000020E6100000...',
       });
       expect(venue.coordinates, isNull);
+    });
+  });
+
+  group('MyParticipation.fromRow', () {
+    Map<String, dynamic> row({
+      String status = 'confirmed',
+      int? secs,
+      int? pos,
+      String sessionStatus = 'active',
+    }) =>
+        {
+          'participant_id': 'p1',
+          'session_id': 's1',
+          'status': status,
+          'seconds_until_expiry': secs,
+          'waitlist_position': pos,
+          'session_status': sessionStatus,
+          'start_time': '2026-09-27T10:00:00Z',
+          'end_time': '2026-09-27T11:30:00Z',
+          'venue_id': 'v1',
+        };
+
+    test('parses all fields', () {
+      final p = MyParticipation.fromRow(row(status: 'waitlisted', pos: 2));
+      expect(p.sessionId, 's1');
+      expect(p.waitlistPosition, 2);
+      expect(p.startTime.toUtc().hour, 10);
+      expect(p.statusLabel, 'Waitlist #2');
+    });
+
+    test('a live pending promotion is an offer to surface in-app', () {
+      final p = MyParticipation.fromRow(row(status: 'pending_confirmation', secs: 600));
+      expect(p.isPendingOffer, isTrue);
+      expect(p.statusLabel.toLowerCase(), contains('confirm'));
+    });
+
+    test('an expired or cancelled-session promotion is NOT surfaced as an offer', () {
+      expect(MyParticipation.fromRow(row(status: 'pending_confirmation', secs: 0)).isPendingOffer, isFalse);
+      final cancelled =
+          MyParticipation.fromRow(row(status: 'pending_confirmation', secs: 600, sessionStatus: 'cancelled'));
+      expect(cancelled.isPendingOffer, isFalse);
+      expect(cancelled.statusLabel, 'Session cancelled');
+    });
+
+    test('confirmed/waitlisted rows are never offers', () {
+      expect(MyParticipation.fromRow(row()).isPendingOffer, isFalse);
+      expect(MyParticipation.fromRow(row(status: 'waitlisted', pos: 1)).isPendingOffer, isFalse);
     });
   });
 
