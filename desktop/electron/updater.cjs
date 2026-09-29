@@ -111,6 +111,8 @@ function attach(win) {
     if ("autoInstallEvent" in autoUpdater) autoUpdater.autoInstallEvent = "onQuit";
     autoUpdater.allowDowngrade = false;
     autoUpdater.autoRunAppAfterInstall = true;
+    // Only full NSIS installers are published; no web installer.
+    if ("disableWebInstaller" in autoUpdater) autoUpdater.disableWebInstaller = true;
     autoUpdater.logger = {
       info: (...a) => log("info", ...a),
       warn: (...a) => log("warn", ...a),
@@ -172,7 +174,12 @@ function install() {
     // up rather than forcing a restart.
     return false;
   }
-  autoUpdater.quitAndInstall(false, true);
+  // isSilent=true: OpenPlay ships an assisted (oneClick: false) NSIS
+  // installer, so a non-silent update run shows the full setup wizard
+  // ("Only for me / Next / Finish") -- observed in the real 1.0.1 -> 1.0.2
+  // update test. Silent mode reuses the existing install location, and
+  // forceRunAfter relaunches the app when the update is done.
+  autoUpdater.quitAndInstall(true, true);
   return true;
 }
 
