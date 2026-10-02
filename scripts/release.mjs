@@ -83,7 +83,7 @@ const isReleasableEntry = (e) => isReleasable(e.path) && (!e.renamedFrom || isRe
 const startedAt = Date.now();
 let stage = "preflight";
 const state = {
-  baseSha: null, versionsBumped: false, releaseDirCleaned: false,
+  baseSha: null, resume: false, versionsBumped: false, releaseDirCleaned: false,
   committed: false, commitHash: null, pushed: false, ghReleaseStarted: false, tag: null, slug: null,
 };
 const bumpedFiles = [];
@@ -141,23 +141,22 @@ function restoreVersionFiles() {
 
 function describeState() {
   const lines = [];
-  if (!state.versionsBumped) lines.push("Version files: NOT modified.");
+  if (state.resume) lines.push(`Resume mode: version files untouched; releasing the already-committed HEAD (${state.baseSha?.slice(0, 7)}).`);
+  else if (!state.versionsBumped) lines.push("Version files: NOT modified.");
   else if (!state.committed) lines.push("Version files were bumped and NOT committed. Automatic restore:", ...restoreVersionFiles());
   else lines.push(`Version files were bumped and committed (${state.commitHash}).`);
   lines.push(state.releaseDirCleaned ? "desktop/release/ was cleaned for this build; its contents may be partial." : "desktop/release/: untouched.");
-  lines.push(state.committed ? `Commit: ${state.commitHash} exists locally.` : "Commit: none created.");
+  if (!state.resume) lines.push(state.committed ? `Commit: ${state.commitHash} exists locally.` : "Commit: none created.");
   lines.push(state.pushed ? "Push: origin/main was updated." : "Push: nothing pushed.");
   lines.push(state.ghReleaseStarted
     ? `GitHub release ${state.tag}: state UNCONFIRMED. Check: gh release view ${state.tag} --repo ${state.slug}`
     : "GitHub release: none created.");
-  if (state.committed && !state.pushed) {
-    lines.push("Recovery: inspect `git show --stat HEAD`, then `git push origin main` (never force) or undo with `git reset --soft HEAD~1`.");
-  } else if (state.pushed) {
+  if (state.committed || state.resume) {
+    // The version is committed but unpublished: a re-run detects that and
+    // resumes (no second bump, no second commit).
     lines.push(
-      `Recovery: the release commit is on origin/main. Do NOT re-run \`npm run release\` (it would bump again). ` +
-        `Fix the cause, then attach the already-built artifacts from desktop/release/ with: ` +
-        `gh release create ${state.tag} --repo ${state.slug} --target ${state.commitHash} --title ${state.tag} <exe> <exe.blockmap> latest.yml <apk>` +
-        (state.ghReleaseStarted ? ` (or delete the partial release first: gh release delete ${state.tag} --repo ${state.slug} --cleanup-tag)` : "")
+      `Recovery: fix the cause and re-run \`npm run release\` -- it resumes ${state.tag} from the committed version (no new bump or commit).` +
+        (state.ghReleaseStarted ? ` If a partial release exists, delete it first: gh release delete ${state.tag} --repo ${state.slug} --cleanup-tag` : "")
     );
   } else {
     lines.push("Recovery: fix the reported problem and re-run `npm run release` (try `npm run release -- --preflight-only` first).");
@@ -231,6 +230,13 @@ function bumpVersion(v, type) {
   if (type === "major") return `${ma + 1}.0.0`;
   if (type === "minor") return `${ma}.${mi + 1}.0`;
   return `${ma}.${mi}.${pa + 1}`;
+}
+
+function compareVersions(a, b) {
+  const pa = a.split(".").map(Number);
+  const pb = b.split(".").map(Number);
+  for (let i = 0; i < 3; i++) if (pa[i] !== pb[i]) return pa[i] - pb[i];
+  return 0;
 }
 
 function parseProperties(text) {
@@ -322,6 +328,14 @@ check("Git branch is main, no operation in progress, nothing pre-staged", () => 
   return `HEAD ${state.baseSha.slice(0, 7)}`;
 });
 
+// The repo lives on a USB drive; an interrupted write once left empty object
+// files behind a successful-looking commit. Refuse to build on a corrupt repo.
+check("Repository integrity (git fsck --full)", () => {
+  const fsck = tryCapture("git", ["fsck", "--full", "--no-dangling", "--no-progress"], { cwd: root });
+  if (!fsck.ok) throw new Error(`git fsck reports corruption -- repair the repository before releasing:\n${fsck.text}`);
+  return "no missing or corrupt objects";
+});
+
 check("Working tree holds only releasable source changes", () => {
   if (initialEntries.length === 0) return "clean (releasing already-committed changes)";
   for (const e of initialEntries) console.log(`           ${e.code} ${e.path}`);
@@ -344,6 +358,19 @@ check("Windows and Android versions are in sync", () => {
   if (!/^\d+\.\d+\.\d+$/.test(ctx.current)) throw new Error(`desktop/package.json version "${ctx.current}" is not X.Y.Z.`);
   if (pubspec[1] !== ctx.current) throw new Error(`Version mismatch: desktop/package.json ${ctx.current} vs app/pubspec.yaml ${pubspec[1]}.`);
   if (lock.version !== ctx.current || lock.packages?.[""]?.version !== ctx.current) throw new Error(`desktop/package-lock.json version does not match desktop/package.json (${ctx.current}).`);
+  // A committed version newer than the last release tag means an earlier run
+  // bumped + committed but never published: resume it instead of bumping again.
+  const lastTag = tryCapture("git", ["describe", "--tags", "--abbrev=0", "--match", "v*"], { cwd: root });
+  const lastVersion = lastTag.ok ? lastTag.output.trim().replace(/^v/, "") : null;
+  if (lastVersion && /^\d+\.\d+\.\d+$/.test(lastVersion) && compareVersions(ctx.current, lastVersion) > 0) {
+    if (initialEntries.length) throw new Error(`Resuming unpublished v${ctx.current} (committed, newer than v${lastVersion}) requires a clean working tree. Commit or stash the changes listed above first.`);
+    if (bumpType !== "patch") throw new Error(`v${ctx.current} is committed but unpublished; resume it with a plain \`npm run release\` before requesting a ${bumpType} bump.`);
+    state.resume = true;
+    ctx.next = ctx.current;
+    ctx.nextCode = ctx.currentCode;
+    state.tag = `v${ctx.next}`;
+    return `RESUME: ${ctx.current}+${ctx.currentCode} is already committed (HEAD ${state.baseSha.slice(0, 7)}) but unpublished (last release v${lastVersion}) -- no bump, no new commit`;
+  }
   ctx.next = bumpVersion(ctx.current, bumpType);
   ctx.nextCode = ctx.currentCode + 1;
   state.tag = `v${ctx.next}`;
@@ -351,6 +378,7 @@ check("Windows and Android versions are in sync", () => {
 });
 
 check("There is something to release", () => {
+  if (state.resume) return `unpublished v${ctx.next} is committed`;
   if (initialEntries.length) return "working tree has changes";
   const prevTag = tryCapture("git", ["describe", "--tags", "--abbrev=0", "--match", "v*"], { cwd: root });
   if (prevTag.ok) {
@@ -454,7 +482,7 @@ for (const [name, cmd, args, cwd] of testSuites) {
 
 console.log(`
 Preflight PASSED.
-  Version: ${ctx.current}+${ctx.currentCode} -> ${ctx.next}+${ctx.nextCode}
+  Version: ${state.resume ? `${ctx.next}+${ctx.nextCode} (resume: already committed, no bump)` : `${ctx.current}+${ctx.currentCode} -> ${ctx.next}+${ctx.nextCode}`}
   Release: ${state.tag} on ${ctx.slug}`);
 if (preflightOnly) {
   releaseUnlock();
@@ -467,27 +495,31 @@ if (preflightOnly) {
 // ---------------------------------------------------------------------------
 stage = "version-bump";
 logStep("Apply version bump");
-state.versionsBumped = true;
-const bumpPlan = [
-  ["desktop/package.json", (raw) => raw.replace(/("version":\s*)"[^"]+"/, `$1"${ctx.next}"`)],
-  // Top-level "version" and packages[""].version -- the first two occurrences.
-  ["desktop/package-lock.json", (raw) => {
-    let n = 0;
-    return raw.replace(/("version":\s*)"[^"]+"/g, (m, k) => (n++ < 2 ? `${k}"${ctx.next}"` : m));
-  }],
-  ["app/pubspec.yaml", (raw) => raw.replace(/^version:\s*\S+/m, `version: ${ctx.next}+${ctx.nextCode}`)],
-];
-for (const [rel, edit] of bumpPlan) {
-  const p = path.join(root, rel);
-  const original = readFileSync(p, "utf8");
-  bumpedFiles.push({ rel, path: p, original, written: edit(original) });
+if (state.resume) {
+  console.log(`Resume: ${ctx.next}+${ctx.nextCode} is already committed -- skipping the bump.`);
+} else {
+  state.versionsBumped = true;
+  const bumpPlan = [
+    ["desktop/package.json", (raw) => raw.replace(/("version":\s*)"[^"]+"/, `$1"${ctx.next}"`)],
+    // Top-level "version" and packages[""].version -- the first two occurrences.
+    ["desktop/package-lock.json", (raw) => {
+      let n = 0;
+      return raw.replace(/("version":\s*)"[^"]+"/g, (m, k) => (n++ < 2 ? `${k}"${ctx.next}"` : m));
+    }],
+    ["app/pubspec.yaml", (raw) => raw.replace(/^version:\s*\S+/m, `version: ${ctx.next}+${ctx.nextCode}`)],
+  ];
+  for (const [rel, edit] of bumpPlan) {
+    const p = path.join(root, rel);
+    const original = readFileSync(p, "utf8");
+    bumpedFiles.push({ rel, path: p, original, written: edit(original) });
+  }
+  for (const f of bumpedFiles) writeFileSync(f.path, f.written);
+  {
+    const lock = JSON.parse(readFileSync(path.join(desktopDir, "package-lock.json"), "utf8"));
+    if (lock.version !== ctx.next || lock.packages[""].version !== ctx.next) fail("Version bump", "package-lock.json bump did not land on the expected fields.");
+  }
+  console.log(`${ctx.current}+${ctx.currentCode} -> ${ctx.next}+${ctx.nextCode}`);
 }
-for (const f of bumpedFiles) writeFileSync(f.path, f.written);
-{
-  const lock = JSON.parse(readFileSync(path.join(desktopDir, "package-lock.json"), "utf8"));
-  if (lock.version !== ctx.next || lock.packages[""].version !== ctx.next) fail("Version bump", "package-lock.json bump did not land on the expected fields.");
-}
-console.log(`${ctx.current}+${ctx.currentCode} -> ${ctx.next}+${ctx.nextCode}`);
 
 // ---------------------------------------------------------------------------
 // 3. Builds (always from current source; stale output is deleted first)
@@ -600,36 +632,63 @@ stage = "commit";
 logStep("Commit");
 if (git(["rev-parse", "HEAD"]).trim() !== state.baseSha) fail("Commit", "HEAD moved since preflight.");
 const postEntries = readWorkingTree();
-const strays = postEntries.filter((e) => !VERSION_FILES.includes(e.path) && !isReleasableEntry(e));
-if (strays.length) fail("Commit", `Unexpected change(s) appeared during the build:\n${strays.map((e) => `  ${e.code} ${e.path}`).join("\n")}`);
-const missingBump = VERSION_FILES.filter((p) => !postEntries.some((e) => e.path === p));
-if (missingBump.length) fail("Commit", `Version file(s) not modified: ${missingBump.join(", ")}`);
-const toStage = postEntries.flatMap((e) => (e.renamedFrom ? [e.path, e.renamedFrom] : [e.path]));
-if (git(["diff", "--cached", "--name-only"]).trim()) fail("Commit", "The index gained staged changes during the release.");
-try {
-  capture("git", ["add", "-A", "--", ...toStage], { cwd: root });
-} catch (err) {
-  fail("Commit", `git add failed: ${err.message}`);
+let commitSha;
+if (state.resume) {
+  // Nothing to commit: the release commit already exists. The build must not
+  // have changed any tracked or untracked source either.
+  if (postEntries.length) fail("Commit", `Resume mode expects a clean tree, but the build changed:\n${postEntries.map((e) => `  ${e.code} ${e.path}`).join("\n")}`);
+  commitSha = state.baseSha;
+  state.commitHash = commitSha.slice(0, 7);
+  console.log(`Resume: releasing existing commit ${state.commitHash} (no new commit)`);
+} else {
+  const strays = postEntries.filter((e) => !VERSION_FILES.includes(e.path) && !isReleasableEntry(e));
+  if (strays.length) fail("Commit", `Unexpected change(s) appeared during the build:\n${strays.map((e) => `  ${e.code} ${e.path}`).join("\n")}`);
+  const missingBump = VERSION_FILES.filter((p) => !postEntries.some((e) => e.path === p));
+  if (missingBump.length) fail("Commit", `Version file(s) not modified: ${missingBump.join(", ")}`);
+  const toStage = postEntries.flatMap((e) => (e.renamedFrom ? [e.path, e.renamedFrom] : [e.path]));
+  if (git(["diff", "--cached", "--name-only"]).trim()) fail("Commit", "The index gained staged changes during the release.");
+  try {
+    capture("git", ["add", "-A", "--", ...toStage], { cwd: root });
+  } catch (err) {
+    fail("Commit", `git add failed: ${err.message}`);
+  }
+  const staged = git(["diff", "--cached", "--name-only", "-z"]).split("\0").filter(Boolean).sort();
+  const expected = [...new Set(postEntries.map((e) => e.path))].sort();
+  if (staged.join("\n") !== expected.join("\n")) {
+    try { capture("git", ["restore", "--staged", "--", ...toStage], { cwd: root }); } catch { /* best effort */ }
+    fail("Commit", `Staged set differs from the approved set.\n  expected: ${expected.join(", ")}\n  staged:   ${staged.join(", ")}`);
+  }
+  const stagedTree = git(["write-tree"]).trim();
+  writeFileSync(commitMsgPath, `Release v${ctx.next}\n\n- Windows desktop: ${ctx.current} -> ${ctx.next}\n- Android: ${ctx.current} (${ctx.currentCode}) -> ${ctx.next} (${ctx.nextCode})\n`);
+  try {
+    capture("git", ["commit", "-F", commitMsgPath], { cwd: root });
+  } catch (err) {
+    // git can exit non-zero AFTER updating HEAD (e.g. printing the summary
+    // failed). If HEAD is exactly our commit, it succeeded -- never report
+    // "commit failed" and never restore version files over a real commit.
+    const head = tryCapture("git", ["rev-parse", "HEAD", "HEAD^", "HEAD^{tree}"], { cwd: root });
+    const [headSha, parentSha, headTree] = head.ok ? head.output.trim().split(/\r?\n/) : [];
+    if (headSha && headSha !== state.baseSha && parentSha === state.baseSha && headTree === stagedTree) {
+      console.log(`WARNING: git commit exited non-zero but created the release commit ${headSha.slice(0, 7)}:\n${String(err.stderr || err.message).trim()}`);
+    } else {
+      try { capture("git", ["restore", "--staged", "--", ...toStage], { cwd: root }); } catch { /* best effort */ }
+      fail("Commit", `git commit failed: ${String(err.stderr || err.message)}`);
+    }
+  } finally {
+    try { unlinkSync(commitMsgPath); } catch { /* ignore */ }
+  }
+  state.committed = true;
+  commitSha = git(["rev-parse", "HEAD"]).trim();
+  state.commitHash = commitSha.slice(0, 7);
+  // Every blob of the new commit must be readable (the diff reads them all);
+  // a corrupt commit must never reach push.
+  const integrity = tryCapture("git", ["diff", "--stat", state.baseSha, commitSha], { cwd: root });
+  const matches = tryCapture("git", ["diff", "--quiet", commitSha, "--", ...toStage], { cwd: root });
+  if (!integrity.ok || !matches.ok) {
+    fail("Commit", `Commit ${state.commitHash} was created but cannot be read back intact (run \`git fsck --full\`):\n${integrity.text || matches.text || "working tree differs from the commit"}`);
+  }
+  console.log(`Committed ${state.commitHash} (${staged.length} path(s)), contents verified`);
 }
-const staged = git(["diff", "--cached", "--name-only", "-z"]).split("\0").filter(Boolean).sort();
-const expected = [...new Set(postEntries.map((e) => e.path))].sort();
-if (staged.join("\n") !== expected.join("\n")) {
-  try { capture("git", ["restore", "--staged", "--", ...toStage], { cwd: root }); } catch { /* best effort */ }
-  fail("Commit", `Staged set differs from the approved set.\n  expected: ${expected.join(", ")}\n  staged:   ${staged.join(", ")}`);
-}
-writeFileSync(commitMsgPath, `Release v${ctx.next}\n\n- Windows desktop: ${ctx.current} -> ${ctx.next}\n- Android: ${ctx.current} (${ctx.currentCode}) -> ${ctx.next} (${ctx.nextCode})\n`);
-try {
-  capture("git", ["commit", "-F", commitMsgPath], { cwd: root });
-} catch (err) {
-  try { capture("git", ["restore", "--staged", "--", ...toStage], { cwd: root }); } catch { /* best effort */ }
-  fail("Commit", `git commit failed: ${String(err.stderr || err.message)}`);
-} finally {
-  try { unlinkSync(commitMsgPath); } catch { /* ignore */ }
-}
-state.committed = true;
-const commitSha = git(["rev-parse", "HEAD"]).trim();
-state.commitHash = commitSha.slice(0, 7);
-console.log(`Committed ${state.commitHash} (${staged.length} path(s))`);
 
 // ---------------------------------------------------------------------------
 // 6. Push -- plain push, never forced, then verified
